@@ -49,6 +49,8 @@ class Weaver:
         self.block = ()            # launch block dims from meta.json
         self.grid = ()             # launch grid dims from meta.json
         self.shapes = {}           # buffer name -> shape tuple (row-major)
+        self.smem_dynamic = False  # True when total smem exceeds 48KB
+        self.smem_offset = 0       # next free byte offset (dynamic mode)
 
     # -- register / label plumbing -------------------------------------
 
@@ -91,6 +93,13 @@ class Weaver:
                 raise WeaveError("index BinaryExpr op %r not woven" % (e.op,))
             self.emit("%s %s, %s, %s;" % (ops[e.op], r, a, b))
             return r
+        if t == "TernaryExpr":
+            p = self.pred_of(e.cond)
+            a = self.expr_i32(e.if_true)
+            b = self.expr_i32(e.if_false)
+            r = self.reg("r")
+            self.emit("selp.u32 %s, %s, %s, %s;" % (r, a, b, p))
+            return r
         raise WeaveError("index expression kind %s not woven" % t)
 
     def pred_of(self, e):
@@ -109,6 +118,10 @@ class Weaver:
 
     def flat_index(self, buffer, index_exprs, extra, shape):
         """Row-major flattened element index (%r) for an index tuple."""
+        if not index_exprs:
+            idx = self.reg("r")
+            self.emit("mov.u32 %s, %d;" % (idx, extra))
+            return idx
         if len(index_exprs) == 1:
             idx = self.expr_i32(index_exprs[0])
         else:
@@ -164,6 +177,26 @@ class Weaver:
         self.emit("setp.ge.u32 %s, %s, %d;" % (p, coord, extent))
         self.emit("@%s bra %s;" % (p, end))
 
+    def decompose(self, total_reg, axes, end):
+        """Split a linear id (blockIdx.x or threadIdx.x) into axis
+        coordinates, row-major over the axes' extents."""
+        extents = [int(a.extent.expr.value) for a in axes]
+        for i, ax in enumerate(axes):
+            rest = 1
+            for e in extents[i + 1:]:
+                rest *= e
+            coord = total_reg
+            if rest != 1:
+                d = self.reg("r")
+                self.emit("div.u32 %s, %s, %d;" % (d, total_reg, rest))
+                coord = d
+            if len(axes) > 1:
+                m = self.reg("r")
+                self.emit("rem.u32 %s, %s, %d;" % (m, coord, extents[i]))
+                coord = m
+            self.axis_vars[ax.name] = coord
+            self.guard_axis(coord, extents[i], end)
+
     def stmt_Tile(self, s):
         # Axis assignment, as the open problems demonstrate it:
         # a single axis takes the global thread coordinate along x
@@ -174,6 +207,36 @@ class Weaver:
         # within the block (r04: 64 rows on grid.x, 128 cooperating
         # threads per row).
         end = self.label("tile_end")
+        # Split the axes into grid axes (prefix) and thread axes
+        # (suffix): the thread axes are the maximal suffix whose
+        # extents multiply to exactly the block size. Whatever
+        # prefix remains decomposes blockIdx.x. (m01: 16,8 | 16,32
+        # over grid 128 / block 512; m02: 32,8,2 | 8,32 over grid
+        # 512 / block 256; r04: 64 | 128 over grid 64 / block 128.)
+        axes = list(s.axes)
+        block_total = 1
+        for d in self.block:
+            block_total *= d
+        thread_axes = []
+        if self.block:
+            prod = 1
+            i = len(axes)
+            while i > 0 and prod < block_total:
+                prod *= int(axes[i - 1].extent.expr.value)
+                i -= 1
+            if prod == block_total:
+                thread_axes = axes[i:]
+        grid_axes = axes[:len(axes) - len(thread_axes)]
+        if grid_axes and thread_axes:
+            cta = self.reg("r")
+            self.emit("mov.u32 %s, %%ctaid.x;" % cta)
+            self.decompose(cta, grid_axes, end)
+            tid = self.reg("r")
+            self.emit("mov.u32 %s, %%tid.x;" % tid)
+            self.decompose(tid, thread_axes, end)
+            self.walk(list(s.body))
+            self.emit_label(end)
+            return
         if len(s.axes) == 1:
             ax = s.axes[0]
             extent = int(ax.extent.expr.value)
@@ -207,7 +270,7 @@ class Weaver:
         self.emit_label(end)
 
     def stmt_Load(self, s):
-        if s.dtype.name != "f32":
+        if s.dtype is not None and s.dtype.name != "f32":
             raise WeaveError("Load dtype %s not woven" % s.dtype.name)
         for i, name in enumerate(s.names):
             r = self.reg("f")
@@ -221,12 +284,51 @@ class Weaver:
                 raise WeaveError("Load from unknown buffer %r" % (s.input,))
             self.values[name] = (r, "f32")
 
+    def register_smem(self, name, size, align, shape):
+        """Record a shared buffer. In dynamic mode (>48KB total) all
+        buffers are carved from one extern array at aligned offsets;
+        in static mode each gets its own .shared declaration."""
+        if name in self.smem:
+            return
+        if self.smem_dynamic:
+            offset = (self.smem_offset + align - 1) // align * align
+            self.smem_offset = offset + size
+            self.smem[name] = (size, align, 4, shape, offset)
+        else:
+            self.smem[name] = (size, align, 4, shape, 0)
+            decl = ".shared .align %d .b8 %s[%d];" % (align, name, size)
+            if decl not in self.smem_decls:
+                self.smem_decls.append(decl)
+
+    def smem_base_r(self, buffer):
+        """32-bit shared-window base address of a named buffer."""
+        addr = self.reg("r")
+        if self.smem_dynamic:
+            self.emit("mov.u32 %s, _lol_dynamic_smem;" % addr)
+            offset = self.smem[buffer][4]
+            if offset:
+                self.emit("add.u32 %s, %s, %d;" % (addr, addr, offset))
+        else:
+            self.emit("mov.u32 %s, %s;" % (addr, buffer))
+        return addr
+
+    def smem_base_rd(self, buffer):
+        """64-bit generic base address of a named buffer (cp.async)."""
+        addr = self.reg("rd")
+        if self.smem_dynamic:
+            self.emit("mov.u64 %s, _lol_dynamic_smem;" % addr)
+            offset = self.smem[buffer][4]
+            if offset:
+                self.emit("add.u64 %s, %s, %d;" % (addr, addr, offset))
+        else:
+            self.emit("mov.u64 %s, %s;" % (addr, buffer))
+        return addr
+
     def smem_address_of(self, buffer, index_exprs, extra):
         """Shared-memory address (%r, 32-bit) of buffer[index + extra]."""
         shape = self.smem[buffer][3] if len(self.smem[buffer]) > 3 else None
         idx = self.flat_index(buffer, index_exprs, extra, shape)
-        addr = self.reg("r")
-        self.emit("mov.u32 %s, %s;" % (addr, buffer))
+        addr = self.smem_base_r(buffer)
         off = self.reg("r")
         self.emit("add.u32 %s, %s, %s;" % (off, idx, idx))   # 2*idx
         self.emit("add.u32 %s, %s, %s;" % (off, off, off))   # 4*idx
@@ -260,11 +362,13 @@ class Weaver:
         elif op == "relu" and len(regs) == 1:
             self.emit("mov.f32 %s, 0f00000000;" % out)
             self.emit("max.f32 %s, %s, %s;" % (out, regs[0], out))
+        elif op == "copy" and len(regs) == 1:
+            self.emit("mov.f32 %s, %s;" % (out, regs[0]))
         elif op == "exp" and len(regs) == 1:
             # exp(x) = ex2(x * log2(e)); 0f3FB8AA3B is log2(e) in f32 hex.
             self.emit("mul.rn.f32 %s, %s, 0f3FB8AA3B;" % (out, regs[0]))
             self.emit("ex2.approx.f32 %s, %s;" % (out, out))
-        elif op == "recip" and len(regs) == 1:
+        elif op in ("recip", "reciprocal") and len(regs) == 1:
             self.emit("mov.f32 %s, 0f3F800000;" % out)  # 1.0
             self.emit("div.rn.f32 %s, %s, %s;" % (out, out, regs[0]))
         else:
@@ -273,7 +377,7 @@ class Weaver:
         self.values[s.name] = (out, "f32")
 
     def stmt_Write(self, s):
-        if s.value_dtype.name != "f32":
+        if s.value_dtype is not None and s.value_dtype.name != "f32":
             raise WeaveError("Write dtype %s not woven" % s.value_dtype.name)
         for i, vname in enumerate(s.values):
             if vname not in self.values:
@@ -284,8 +388,7 @@ class Weaver:
                     raise WeaveError("atomic shared Write not woven")
                 if not s.index:
                     # Scalar shared cell: index () means element 0.
-                    addr = self.reg("r")
-                    self.emit("mov.u32 %s, %s;" % (addr, s.output))
+                    addr = self.smem_base_r(s.output)
                 else:
                     addr = self.smem_address_of(s.output, s.index, i)
                 self.emit("st.shared.f32 [%s], %s;" % (addr, reg))
@@ -303,8 +406,12 @@ class Weaver:
 
     # -- reduction machinery (category 2) --------------------------------
 
+    # Emmy's own renderer seeds maximum with -1e30 (a finite
+    # sentinel), not -inf; mirror that exactly -- with -inf the
+    # rescaling exp(acc - new_max) can meet inf - inf = NaN paths
+    # the reference never takes.
     ACCUM_IDENTITY = {"add": "0f00000000", "multiply": "0f3F800000",
-                      "maximum": "0fFF800000", "minimum": "0f7F800000"}
+                      "maximum": "0fF149F2CA", "minimum": "0f7149F2CA"}
 
     def init_accum(self, s):
         if s.name in self.values:
@@ -331,7 +438,17 @@ class Weaver:
         # PLACE, in its permanent register. Rebinding to a fresh
         # register (the straight-line Assign move) would emit one
         # instruction that re-reads the identity every iteration.
-        self.emit("%s %s, %s, %s;" % (ptx, acc_reg, acc_reg, val_reg))
+        # With a base, the step is acc = op(base, value): the body
+        # has already folded the old accumulator into base (online
+        # softmax: base = acc * exp(old_max - new_max)). Without a
+        # base, the step is acc = op(acc, value).
+        if s.base is not None:
+            if s.base not in self.values:
+                raise WeaveError("Accum base %r not an SSA value" % (s.base,))
+            base_reg = self.values[s.base][0]
+            self.emit("%s %s, %s, %s;" % (ptx, acc_reg, base_reg, val_reg))
+        else:
+            self.emit("%s %s, %s, %s;" % (ptx, acc_reg, acc_reg, val_reg))
 
     def stmt_StridedLoop(self, s):
         if s.unroll:
@@ -367,23 +484,131 @@ class Weaver:
         else:
             self.axis_vars[axis_name] = prev
 
+    # -- matmul machinery (category 3) ------------------------------------
+
+    @staticmethod
+    def f32_hex(value):
+        import struct
+        return "0f%08X" % struct.unpack("<I", struct.pack("<f", value))[0]
+
+    def stmt_Let(self, s):
+        """Bind a pure value: a scalar literal or a small expression
+        tree. (Softmax/attention use it for the literal 1.0.)"""
+        v = s.value
+        t = type(v).__name__
+        dtype = s.dtype.name if s.dtype is not None else None
+        if t == "Literal":
+            if dtype == "f32" or isinstance(v.value, float):
+                r = self.reg("f")
+                self.emit("mov.f32 %s, %s;"
+                          % (r, self.f32_hex(float(v.value))))
+                self.values[s.name] = (r, "f32")
+            else:
+                r = self.reg("r")
+                self.emit("mov.u32 %s, %d;" % (r, int(v.value)))
+                self.values[s.name] = (r, "i32")
+            return
+        if t == "Var":
+            if v.name not in self.values:
+                raise WeaveError("Let Var %r undefined" % (v.name,))
+            self.values[s.name] = self.values[v.name]
+            return
+        if t == "BinaryExpr":
+            # Integer expression tree (an index or bound).
+            r = self.expr_i32(v)
+            self.values[s.name] = (r, "i32")
+            return
+        raise WeaveError("Let value kind %s not woven" % t)
+
+    def stmt_Init(self, s):
+        if s.dtype.name != "f32":
+            raise WeaveError("Init dtype %s not woven" % s.dtype.name)
+        r = self.reg("f")
+        self.emit("mov.f32 %s, %s;" % (r, self.f32_hex(float(s.identity))))
+        self.values[s.name] = (r, "f32")
+
+    def stmt_Loop(self, s):
+        # A plain Loop over its axis, 0 .. extent-1 step 1. Whether
+        # the IR marks it unrolled or not, a runtime loop over the
+        # same body is the same computation; accumulators inside
+        # are updated in place (see stmt_Accum).
+        body = list(s.body)
+        for st in body:
+            if type(st).__name__ == "Accum":
+                self.init_accum(st)
+        var = self.reg("r")
+        self.emit("mov.u32 %s, 0;" % var)
+        axis_name = s.axis.name
+        prev = self.axis_vars.get(axis_name)
+        self.axis_vars[axis_name] = var
+        extent = int(s.axis.extent.expr.value)
+        head = self.label("loop")
+        end = self.label("loop_end")
+        self.emit_label(head)
+        p = self.reg("p")
+        self.emit("setp.ge.s32 %s, %s, %d;" % (p, var, extent))
+        self.emit("@%s bra %s;" % (p, end))
+        self.walk(body)
+        self.emit("add.u32 %s, %s, 1;" % (var, var))
+        self.emit("bra %s;" % head)
+        self.emit_label(end)
+        if prev is None:
+            del self.axis_vars[axis_name]
+        else:
+            self.axis_vars[axis_name] = prev
+
+    def stmt_CpAsyncCopy(self, s):
+        if s.swizzle != "NONE":
+            raise WeaveError("cp.async swizzle %r not woven" % (s.swizzle,))
+        if s.smem not in self.smem:
+            raise WeaveError("cp.async into undeclared smem %r" % (s.smem,))
+        shape = self.smem[s.smem][3]
+        base = self.flat_index(s.smem, s.smem_index, 0, shape)
+        lane = self.flat_index(s.smem, s.lane_index, 0, shape)
+        flat = self.reg("r")
+        self.emit("add.u32 %s, %s, %s;" % (flat, base, lane))
+        # 64-bit throughout: a 32-bit cvta is rejected by ptxas for
+        # sm_90+ targets (the runner's GPU), while the u64 form is
+        # what nvcc itself emits for cp.async destinations.
+        dst = self.smem_base_rd(s.smem)
+        wide = self.reg("rd")
+        self.emit("mul.wide.u32 %s, %s, 4;" % (wide, flat))
+        self.emit("add.u64 %s, %s, %s;" % (dst, dst, wide))
+        shared = self.reg("rd")
+        self.emit("cvta.to.shared.u64 %s, %s;" % (shared, dst))
+        src = self.address_of(s.src, s.src_index, 0)
+        nbytes = int(s.nbytes)
+        level = "cg" if nbytes == 16 else "ca"
+        self.emit("cp.async.%s.shared.global [%s], [%s], %d;"
+                  % (level, shared, src, nbytes))
+
+    def stmt_CpAsyncCommit(self, s):
+        self.emit("cp.async.commit_group;")
+
+    def stmt_CpAsyncWait(self, s):
+        self.emit("cp.async.wait_group %d;" % int(s.group))
+
     def stmt_WarpShuffle(self, s):
-        if len(s.state) != 1 or len(s.state_b) != 1:
-            raise WeaveError("multi-state WarpShuffle not woven yet")
-        state, state_b = s.state[0], s.state_b[0]
-        if state not in self.values:
-            raise WeaveError("WarpShuffle state %r undefined" % (state,))
+        # One or more coupled states (softmax carries max + sum):
+        # at each butterfly step every state is shuffled first, then
+        # the combine statements run once over all the pairs.
+        if len(s.state) != len(s.state_b):
+            raise WeaveError("WarpShuffle state/state_b length mismatch")
+        for state in s.state:
+            if state not in self.values:
+                raise WeaveError("WarpShuffle state %r undefined" % (state,))
         delta = s.length // 2
         while delta >= 1:
-            cur = self.values[state][0]
-            bits = self.reg("r")
-            self.emit("mov.b32 %s, %s;" % (bits, cur))
-            shuf = self.reg("r")
-            self.emit("shfl.sync.bfly.b32 %s, %s, %d, 0x%x, 0xffffffff;"
-                      % (shuf, bits, delta, s.length - 1))
-            other = self.reg("f")
-            self.emit("mov.b32 %s, %s;" % (other, shuf))
-            self.values[state_b] = (other, "f32")
+            for state, state_b in zip(s.state, s.state_b):
+                cur = self.values[state][0]
+                bits = self.reg("r")
+                self.emit("mov.b32 %s, %s;" % (bits, cur))
+                shuf = self.reg("r")
+                self.emit("shfl.sync.bfly.b32 %s, %s, %d, 0x%x, 0xffffffff;"
+                          % (shuf, bits, delta, s.length - 1))
+                other = self.reg("f")
+                self.emit("mov.b32 %s, %s;" % (other, shuf))
+                self.values[state_b] = (other, "f32")
             self.walk(list(s.combine_states))
             delta //= 2
 
@@ -391,14 +616,9 @@ class Weaver:
         n = 1
         for e in s.extents:
             n *= int(e.expr.value) if hasattr(e, "expr") else int(e)
-        size = n * 4
-        align = int(s.align) or 4
         shape = tuple(int(e.expr.value) if hasattr(e, "expr") else int(e)
                       for e in s.extents)
-        self.smem[s.name] = (size, align, 4, shape)
-        decl = ".shared .align %d .b8 %s[%d];" % (align, s.name, size)
-        if decl not in self.smem_decls:
-            self.smem_decls.append(decl)
+        self.register_smem(s.name, n * 4, int(s.align) or 4, shape)
 
     def stmt_Sync(self, s):
         if s.warp:
@@ -428,30 +648,31 @@ class Weaver:
             self.emit_label(end)
 
     def stmt_TreeHalve(self, s):
-        if len(s.bufs) != 1 or len(s.state) != 1 or len(s.state_b) != 1:
-            raise WeaveError("multi-buffer TreeHalve not woven yet")
-        buf = s.bufs[0]
-        state, state_b = s.state[0], s.state_b[0]
-        # Fold the length shared-memory partials into state. Every
-        # thread performs the same read-only fold; the guarded Write
-        # that follows decides who stores the result. (The reference
-        # PTX guards the fold to thread 0 instead -- equivalent, since
-        # the fold has no side effects.)
+        if not (len(s.bufs) == len(s.state) == len(s.state_b)):
+            raise WeaveError("TreeHalve bufs/state/state_b length mismatch")
+        # Fold the length shared-memory partials into the states.
+        # Coupled states (softmax max + sum) fold together: at each
+        # step every component's partial is loaded, then the combine
+        # statements run once. Every thread performs the same
+        # read-only fold; the guarded Write that follows decides who
+        # stores the result. (The reference PTX guards the fold to
+        # thread 0 instead -- equivalent, no side effects.)
         for i in range(int(s.length)):
-            r = self.reg("f")
-            idx = self.reg("r")
-            self.emit("mov.u32 %s, %d;" % (idx, i))
-            addr = self.reg("r")
-            self.emit("mov.u32 %s, %s;" % (addr, buf))
-            off = self.reg("r")
-            self.emit("add.u32 %s, %s, %s;" % (off, idx, idx))
-            self.emit("add.u32 %s, %s, %s;" % (off, off, off))
-            self.emit("add.u32 %s, %s, %s;" % (addr, addr, off))
-            self.emit("ld.shared.f32 %s, [%s];" % (r, addr))
-            if i == 0:
-                self.values[state] = (r, "f32")
-            else:
-                self.values[state_b] = (r, "f32")
+            for buf, state, state_b in zip(s.bufs, s.state, s.state_b):
+                r = self.reg("f")
+                idx = self.reg("r")
+                self.emit("mov.u32 %s, %d;" % (idx, i))
+                addr = self.smem_base_r(buf)
+                off = self.reg("r")
+                self.emit("add.u32 %s, %s, %s;" % (off, idx, idx))
+                self.emit("add.u32 %s, %s, %s;" % (off, off, off))
+                self.emit("add.u32 %s, %s, %s;" % (addr, addr, off))
+                self.emit("ld.shared.f32 %s, [%s];" % (r, addr))
+                if i == 0:
+                    self.values[state] = (r, "f32")
+                else:
+                    self.values[state_b] = (r, "f32")
+            if i > 0:
                 self.walk(list(s.combine_states))
 
 
@@ -512,6 +733,39 @@ def compile_kernel(ir_path):
     w.block = block
     w.grid = grid
     w.shapes = dict(shapes)
+
+    # Pre-register every shared buffer before weaving: whether the
+    # buffers fit in static .shared (<= 48KB) or must be carved out
+    # of one dynamic extern array is a whole-kernel decision that
+    # has to be made before any address is emitted.
+    smem_stmts = []
+
+    def collect(stmts):
+        for s in stmts:
+            if type(s).__name__ == "Smem":
+                smem_stmts.append(s)
+            for attr in ("body", "else_body"):
+                sub = getattr(s, attr, None)
+                if sub:
+                    collect(list(sub))
+
+    collect(list(kernel.body))
+    total = 0
+    sizes = []
+    for s in smem_stmts:
+        n = 1
+        for e in s.extents:
+            n *= int(e.expr.value) if hasattr(e, "expr") else int(e)
+        sizes.append(n * 4)
+        total += n * 4
+    if total > 49152:
+        w.smem_dynamic = True
+        w.smem_decls.append(
+            ".extern .shared .align 16 .b8 _lol_dynamic_smem[];")
+    for s, size in zip(smem_stmts, sizes):
+        shape = tuple(int(e.expr.value) if hasattr(e, "expr") else int(e)
+                      for e in s.extents)
+        w.register_smem(s.name, size, int(s.align) or 4, shape)
     for n in graph.nodes.values():
         for t in getattr(n, "outputs", ()) or ():
             shape = tuple(int(d.expr.value) if hasattr(d, "expr")
