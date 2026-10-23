@@ -1,0 +1,8 @@
+    Tile[a0] (N=500)
+        in0__u0 = load x0[((a0 * 2) + 0)]
+        in1__u0 = load x1[((a0 * 2) + 0)]
+        f32 v0__u0 = add(in0__u0, in1__u0)
+        in0__u1 = load x0[((a0 * 2) + 1)]
+        in1__u1 = load x1[((a0 * 2) + 1)]
+        f32 v0__u1 = add(in0__u1, in1__u1)
+        add[((a0 * 2) + 0)] = (v0__u0, v0__u1)

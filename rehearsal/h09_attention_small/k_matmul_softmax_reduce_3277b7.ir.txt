@@ -1,0 +1,44 @@
+    Tile[a0_b, a5_b, a0_u, a5_u] (N=512)
+        in0 = load div_c1[0]
+        f32 v1 = reciprocal(in0)
+        for a1 in 0..32
+            for a2 in 0..32
+                in2__ar0 = load q[(((a0_b * 1) + (a0_u * 1)) + 0), a2]
+                in1__ar0 = load kt[a2, a1]
+                f32 v3__ar0 = multiply(in1__ar0, in2__ar0)
+                f32 acc0__ar0 <- add(acc0__ar0, v3__ar0)
+            f32 v4__c0_0 = multiply(acc0__ar0, v1)
+            f32 one__c0_0 = 1.0
+            f32 v4__gn__c0_0 = maximum(acc1__c0_0, v4__c0_0)
+            f32 v4__dg__c0_0 = subtract(acc1__c0_0, v4__gn__c0_0)
+            f32 v4__alpha__c0_0 = exp(v4__dg__c0_0)
+            f32 v4__dg_o__c0_0 = subtract(v4__c0_0, v4__gn__c0_0)
+            f32 v4__beta__c0_0 = exp(v4__dg_o__c0_0)
+            f32 v4__acc3_sa__c0_0 = multiply(acc3__c0_0, v4__alpha__c0_0)
+            f32 v4__acc3_sb__c0_0 = multiply(one__c0_0, v4__beta__c0_0)
+            f32 acc3__c0_0 <- add(v4__acc3_sa__c0_0, v4__acc3_sb__c0_0)
+            f32 v4__acc5__sum_sa__c0_0 = multiply(acc5__sum__c0_0, v4__alpha__c0_0)
+            in7__bc0, in7__bc1 = load v[a1, (((a5_b * 2) + (a5_u * 2)) + 0)]
+            f32 v4__acc5__sum_sb__c0_0 = multiply(in7__bc0, v4__beta__c0_0)
+            f32 acc5__sum__c0_0 <- add(v4__acc5__sum_sa__c0_0, v4__acc5__sum_sb__c0_0)
+            f32 acc1__c0_0 <- maximum(acc1__c0_0, v4__c0_0)
+            f32 v4__c0_1 = multiply(acc0__ar0, v1)
+            f32 one__c0_1 = 1.0
+            f32 v4__gn__c0_1 = maximum(acc1__c0_1, v4__c0_1)
+            f32 v4__dg__c0_1 = subtract(acc1__c0_1, v4__gn__c0_1)
+            f32 v4__alpha__c0_1 = exp(v4__dg__c0_1)
+            f32 v4__dg_o__c0_1 = subtract(v4__c0_1, v4__gn__c0_1)
+            f32 v4__beta__c0_1 = exp(v4__dg_o__c0_1)
+            f32 v4__acc3_sa__c0_1 = multiply(acc3__c0_1, v4__alpha__c0_1)
+            f32 v4__acc3_sb__c0_1 = multiply(one__c0_1, v4__beta__c0_1)
+            f32 acc3__c0_1 <- add(v4__acc3_sa__c0_1, v4__acc3_sb__c0_1)
+            f32 v4__acc5__sum_sa__c0_1 = multiply(acc5__sum__c0_1, v4__alpha__c0_1)
+            f32 v4__acc5__sum_sb__c0_1 = multiply(in7__bc1, v4__beta__c0_1)
+            f32 acc5__sum__c0_1 <- add(v4__acc5__sum_sa__c0_1, v4__acc5__sum_sb__c0_1)
+            f32 acc1__c0_1 <- maximum(acc1__c0_1, v4__c0_1)
+        f32 v9__c0_0 = reciprocal(acc3__c0_0)
+        f32 acc5__c0_0 = multiply(acc5__sum__c0_0, v9__c0_0)
+        matmul_1[(((a0_b * 1) + (a0_u * 1)) + 0), (((a5_b * 2) + (a5_u * 2)) + 0)] = acc5__c0_0
+        f32 v9__c0_1 = reciprocal(acc3__c0_1)
+        f32 acc5__c0_1 = multiply(acc5__sum__c0_1, v9__c0_1)
+        matmul_1[(((a0_b * 1) + (a0_u * 1)) + 0), (((a5_b * 2) + (a5_u * 2)) + 1)] = acc5__c0_1

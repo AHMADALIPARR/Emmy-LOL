@@ -1,0 +1,15 @@
+    Tile[a0, a1_co] (N=6144)
+        for a1 in a1_co..384:128
+            in1 = load x[a0, a1]
+            f32 acc0 <- add(acc0, in1)
+        WarpShuffle(acc0, length=32)
+        Smem float acc0_smem[4]
+        if ((lane == 0)):
+            acc0_smem[warp] = acc0
+        Sync
+        TreeHalve(acc0, length=4, tid=warp)
+        if ((a1_co == 0)):
+            in0 = load mean_keepdim_count[0]
+            f32 v0 = reciprocal(in0)
+            f32 v1 = multiply(acc0, v0)
+            mean[a0] = v1

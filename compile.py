@@ -172,100 +172,53 @@ class Weaver:
 
     # -- statements ------------------------------------------------------
 
-    def guard_axis(self, coord, extent, end):
-        p = self.reg("p")
-        self.emit("setp.ge.u32 %s, %s, %d;" % (p, coord, extent))
-        self.emit("@%s bra %s;" % (p, end))
-
-    def decompose(self, total_reg, axes, end):
-        """Split a linear id (blockIdx.x or threadIdx.x) into axis
-        coordinates, row-major over the axes' extents."""
+    def stmt_Tile(self, s):
+        # Emmy's own CUDA renderer assigns tile axes from ONE global
+        # thread id -- gid = blockIdx.x * blockDim.x + threadIdx.x --
+        # decomposed row-major over ALL the tile's axes (a01's
+        # reference: a0_b = gid/256, a5_b = (gid/128)%2, ...). The
+        # grid/thread split used earlier is exactly this when the
+        # extents happen to align with the block size, and wrong
+        # when they do not (a (32,16,1,1) tile over grid 2 x block
+        # 256 aligns with neither). Weave the renderer's rule.
+        end = self.label("tile_end")
+        axes = list(s.axes)
         extents = [int(a.extent.expr.value) for a in axes]
+        total = 1
+        for e in extents:
+            total *= e
+        block_total = 1
+        for d in self.block:
+            block_total *= d
+        cta = self.reg("r")
+        self.emit("mov.u32 %s, %%ctaid.x;" % cta)
+        tid = self.reg("r")
+        self.emit("mov.u32 %s, %%tid.x;" % tid)
+        gid = self.reg("rd")
+        self.emit("cvt.u64.u32 %s, %s;" % (gid, cta))
+        self.emit("mul.lo.u64 %s, %s, %d;" % (gid, gid, block_total))
+        tid64 = self.reg("rd")
+        self.emit("cvt.u64.u32 %s, %s;" % (tid64, tid))
+        self.emit("add.u64 %s, %s, %s;" % (gid, gid, tid64))
+        p = self.reg("p")
+        self.emit("setp.ge.u64 %s, %s, %d;" % (p, gid, total))
+        self.emit("@%s bra %s;" % (p, end))
         for i, ax in enumerate(axes):
             rest = 1
             for e in extents[i + 1:]:
                 rest *= e
-            coord = total_reg
+            coord = gid
             if rest != 1:
-                d = self.reg("r")
-                self.emit("div.u32 %s, %s, %d;" % (d, total_reg, rest))
+                d = self.reg("rd")
+                self.emit("div.u64 %s, %s, %d;" % (d, gid, rest))
                 coord = d
             if len(axes) > 1:
-                m = self.reg("r")
-                self.emit("rem.u32 %s, %s, %d;" % (m, coord, extents[i]))
+                m = self.reg("rd")
+                self.emit("rem.u64 %s, %s, %d;" % (m, coord, extents[i]))
                 coord = m
-            self.axis_vars[ax.name] = coord
-            self.guard_axis(coord, extents[i], end)
-
-    def stmt_Tile(self, s):
-        # Axis assignment, as the open problems demonstrate it:
-        # a single axis takes the global thread coordinate along x
-        # (blockIdx.x * blockDim.x + threadIdx.x), so multi-block
-        # launches subdivide that one axis. With two axes, the outer
-        # axis is the block index (blockIdx.x, one block per cell of
-        # it) and the inner "_co" axis is the thread coordinate
-        # within the block (r04: 64 rows on grid.x, 128 cooperating
-        # threads per row).
-        end = self.label("tile_end")
-        # Split the axes into grid axes (prefix) and thread axes
-        # (suffix): the thread axes are the maximal suffix whose
-        # extents multiply to exactly the block size. Whatever
-        # prefix remains decomposes blockIdx.x. (m01: 16,8 | 16,32
-        # over grid 128 / block 512; m02: 32,8,2 | 8,32 over grid
-        # 512 / block 256; r04: 64 | 128 over grid 64 / block 128.)
-        axes = list(s.axes)
-        block_total = 1
-        for d in self.block:
-            block_total *= d
-        thread_axes = []
-        if self.block:
-            prod = 1
-            i = len(axes)
-            while i > 0 and prod < block_total:
-                prod *= int(axes[i - 1].extent.expr.value)
-                i -= 1
-            if prod == block_total:
-                thread_axes = axes[i:]
-        grid_axes = axes[:len(axes) - len(thread_axes)]
-        if grid_axes and thread_axes:
-            cta = self.reg("r")
-            self.emit("mov.u32 %s, %%ctaid.x;" % cta)
-            self.decompose(cta, grid_axes, end)
-            tid = self.reg("r")
-            self.emit("mov.u32 %s, %%tid.x;" % tid)
-            self.decompose(tid, thread_axes, end)
-            self.walk(list(s.body))
-            self.emit_label(end)
-            return
-        if len(s.axes) == 1:
-            ax = s.axes[0]
-            extent = int(ax.extent.expr.value)
-            tid = self.reg("r")
-            self.emit("mov.u32 %s, %%tid.x;" % tid)
-            coord = tid
-            if self.block and self.block[0] > 1:
-                cta = self.reg("r")
-                self.emit("mov.u32 %s, %%ctaid.x;" % cta)
-                base = self.reg("r")
-                self.emit("mul.lo.u32 %s, %s, %d;"
-                          % (base, cta, self.block[0]))
-                coord = self.reg("r")
-                self.emit("add.u32 %s, %s, %s;" % (coord, base, tid))
-            self.axis_vars[ax.name] = coord
-            self.guard_axis(coord, extent, end)
-        elif len(s.axes) == 2:
-            outer, inner = s.axes
-            cta = self.reg("r")
-            self.emit("mov.u32 %s, %%ctaid.x;" % cta)
-            self.axis_vars[outer.name] = cta
-            self.guard_axis(cta, int(outer.extent.expr.value), end)
-            tid = self.reg("r")
-            self.emit("mov.u32 %s, %%tid.x;" % tid)
-            self.axis_vars[inner.name] = tid
-            self.guard_axis(tid, int(inner.extent.expr.value), end)
-        else:
-            raise WeaveError("Tile with %d axes not woven yet"
-                             % len(s.axes))
+            coord32 = self.reg("r")
+            self.emit("cvt.u32.u64 %s, %s;" % (coord32, coord))
+            self.axis_vars[ax.name] = coord32
         self.walk(list(s.body))
         self.emit_label(end)
 
@@ -371,6 +324,48 @@ class Weaver:
         elif op in ("recip", "reciprocal") and len(regs) == 1:
             self.emit("mov.f32 %s, 0f3F800000;" % out)  # 1.0
             self.emit("div.rn.f32 %s, %s, %s;" % (out, out, regs[0]))
+        elif op == "sigmoid" and len(regs) == 1:
+            # sigmoid(x) = 1 / (1 + ex2(-x * log2(e))). An overflowing
+            # ex2 gives inf and 1/inf = 0, the correct limit.
+            self.emit("mul.rn.f32 %s, %s, 0fBFB8AA3B;" % (out, regs[0]))
+            self.emit("ex2.approx.f32 %s, %s;" % (out, out))
+            self.emit("add.rn.f32 %s, %s, 0f3F800000;" % (out, out))
+            one = self.reg("f")
+            self.emit("mov.f32 %s, 0f3F800000;" % one)
+            self.emit("div.rn.f32 %s, %s, %s;" % (out, one, out))
+        elif op == "tanh" and len(regs) == 1:
+            # tanh(x) = (t - 1)/(t + 1) with t = ex2(2x * log2(e)),
+            # the exponent clamped to +-120 so t stays finite and
+            # the quotient saturates to exactly +-1.
+            self.emit("mul.rn.f32 %s, %s, 0f4038AA3B;" % (out, regs[0]))
+            self.emit("max.f32 %s, %s, 0fC2F00000;" % (out, out))
+            self.emit("min.f32 %s, %s, 0f42F00000;" % (out, out))
+            self.emit("ex2.approx.f32 %s, %s;" % (out, out))
+            num = self.reg("f")
+            self.emit("sub.rn.f32 %s, %s, 0f3F800000;" % (num, out))
+            self.emit("add.rn.f32 %s, %s, 0f3F800000;" % (out, out))
+            self.emit("div.rn.f32 %s, %s, %s;" % (out, num, out))
+        elif op == "log" and len(regs) == 1:
+            # ln(x) = lg2(x) * ln(2)
+            self.emit("lg2.approx.f32 %s, %s;" % (out, regs[0]))
+            self.emit("mul.rn.f32 %s, %s, 0f3F317218;" % (out, out))
+        elif op == "log2" and len(regs) == 1:
+            self.emit("lg2.approx.f32 %s, %s;" % (out, regs[0]))
+        elif op == "log10" and len(regs) == 1:
+            self.emit("lg2.approx.f32 %s, %s;" % (out, regs[0]))
+            self.emit("mul.rn.f32 %s, %s, 0f3E9A209B;" % (out, out))
+        elif op == "sin" and len(regs) == 1:
+            self.emit("sin.approx.f32 %s, %s;" % (out, regs[0]))
+        elif op == "cos" and len(regs) == 1:
+            self.emit("cos.approx.f32 %s, %s;" % (out, regs[0]))
+        elif op == "floor" and len(regs) == 1:
+            self.emit("cvt.rmi.f32.f32 %s, %s;" % (out, regs[0]))
+        elif op == "ceil" and len(regs) == 1:
+            self.emit("cvt.rpi.f32.f32 %s, %s;" % (out, regs[0]))
+        elif op == "trunc" and len(regs) == 1:
+            self.emit("cvt.rzi.f32.f32 %s, %s;" % (out, regs[0]))
+        elif op == "square" and len(regs) == 1:
+            self.emit("mul.rn.f32 %s, %s, %s;" % (out, regs[0], regs[0]))
         else:
             raise WeaveError("elementwise op %r (arity %d) not woven"
                              % (op, len(regs)))

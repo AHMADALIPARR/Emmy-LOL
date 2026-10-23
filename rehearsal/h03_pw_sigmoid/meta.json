@@ -1,0 +1,53 @@
+{
+ "id": "h03_pw_sigmoid",
+ "code": "torch.sigmoid(torch.randn(2049))",
+ "rtol": 0.001,
+ "atol": 0.0001,
+ "graph_inputs": [
+  "x"
+ ],
+ "graph_outputs": [
+  "sigmoid"
+ ],
+ "kernels": [
+  {
+   "node": "sigmoid",
+   "entry": "k_sigmoid_pointwise",
+   "arg_order": [
+    "x",
+    "sigmoid"
+   ],
+   "grid": [
+    3,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "x",
+     "dtype": "f32",
+     "shape": [
+      2049
+     ],
+     "seed": 0
+    },
+    {
+     "name": "sigmoid",
+     "dtype": "f32",
+     "shape": [
+      2049
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

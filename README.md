@@ -67,3 +67,12 @@ checked with the task's own `submit.py`:
 
 Reproduce with `./check.sh` (expects the task repository at
 `~/workspace/emmy-hackathon-2026` or `$EMMY_TASK_DIR`).
+
+The hidden set is the same categories at unseen shapes, so the
+weaver was also rehearsed against nine self-generated variants —
+odd lengths, a row-mean, a third matmul shape, wider softmax rows,
+tanh and sigmoid pointwise — minted with the organizers' own
+generator (`rehearsal/`). All nine pass. That rehearsal caught two
+generalizations the open set never forces: tile axes are assigned
+from one global thread id (the renderer's own rule), and an
+Accum's "base" operand folds the old accumulator into the step.
