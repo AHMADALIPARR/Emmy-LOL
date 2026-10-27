@@ -13,12 +13,14 @@ strides, unrolled bodies, constants — is woven into the PTX at
 compile time, as immediates and straight-line code. Nothing at
 runtime computes what the loom already knew.
 
-## What it is
+## How it works
 
-`compile.py` is a direct Kernel IR → PTX lowering, written for this
-task. It loads the IR with Emmy's own classes (`Graph.from_dict` —
-the sanctioned way to read it) and walks the statement tree,
-emitting one PTX translation per statement kind:
+`compile.py` is a direct Kernel IR → PTX lowering. It loads the IR
+with Emmy's own classes (`Graph.from_dict`) and walks the statement
+tree, emitting one PTX translation per statement kind. Dispatch is
+on the statement's type — never on the problem name or filename:
+the weaver lowers what the tree says, it does not guess kernel
+semantics.
 
 - **Tiles** decomposed over grid and block, row-major, with the
   bounds guard derived from the tile's extents
@@ -43,16 +45,7 @@ Weave -inf instead and the softmax rescaling walks an inf − inf
 path the reference never takes; the attention kernels land ~0.75
 off. With the sentinel, they land at 6.6e-07.
 
-## Run it
-
-```bash
-python compile.py path/to/kernel.ir.json > out.ptx
-```
-
-Requires Python 3.12+ and `emmy-ml` (to load the IR). No GPU
-needed — the hackathon's hosted runner assembles and executes.
-
-## Verified
+## Results
 
 All fifteen open problems pass on the hosted runner (RTX 5090),
 checked with the task's own `submit.py`:
@@ -65,9 +58,6 @@ checked with the task's own `submit.py`:
 | fused | f01–f03 | pass |
 | attention-like | a01–a02 | pass |
 
-Reproduce with `./check.sh` (expects the task repository at
-`~/workspace/emmy-hackathon-2026` or `$EMMY_TASK_DIR`).
-
 The hidden set is the same categories at unseen shapes, so the
 weaver was also rehearsed against nine self-generated variants —
 odd lengths, a row-mean, a third matmul shape, wider softmax rows,
@@ -76,3 +66,20 @@ generator (`rehearsal/`). All nine pass. That rehearsal caught two
 generalizations the open set never forces: tile axes are assigned
 from one global thread id (the renderer's own rule), and an
 Accum's "base" operand folds the old accumulator into the step.
+
+## Run it
+
+```bash
+python compile.py path/to/kernel.ir.json > out.ptx
+```
+
+Requires Python 3.12+ and `emmy-ml` (to load the IR). No GPU
+needed — the hackathon's hosted runner assembles and executes.
+Reproduce the full open set with `./check.sh` (expects the task
+repository at `~/workspace/emmy-hackathon-2026` or `$EMMY_TASK_DIR`).
+
+## Layout
+
+- `compile.py` — the weaver
+- `check.sh` — all fifteen open problems through the hosted runner
+- `rehearsal/` — self-generated hidden-set variants and generator
